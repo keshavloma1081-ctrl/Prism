@@ -10,7 +10,7 @@ Zero external dependencies. Pure Pydantic.
 from __future__ import annotations
 from enum import Enum
 from typing import Optional, Dict, Any, List
-from datetime import datetime
+from datetime import datetime, timezone
 from pydantic import BaseModel, Field, model_validator
 import uuid
 
@@ -214,7 +214,7 @@ class WorkflowSession(BaseModel):
 
     def add_event(self, event: EATEvent) -> None:
         self.events.append(event)
-        self.updated_at = datetime.utcnow()
+        self.updated_at = datetime.now(timezone.utc)
 
     def get_events_by_agent(self, agent_id: str) -> List[EATEvent]:
         return [e for e in self.events if e.agent_id == agent_id]
