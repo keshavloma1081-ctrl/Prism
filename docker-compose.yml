@@ -1,0 +1,30 @@
+version: "3.9"
+
+services:
+
+  prism-api:
+    build: .
+    container_name: prism-api
+    ports:
+      - "8000:8000"
+    environment:
+      - ENV=production
+      - LOG_LEVEL=info
+    volumes:
+      - .:/app
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import requests; requests.get('http://localhost:8000/health')"]
+      interval: 30s
+      timeout:  10s
+      retries:  3
+
+  prism-test:
+    build: .
+    container_name: prism-test
+    command: ["pytest", "tests/", "-v", "--no-header", "-q"]
+    volumes:
+      - .:/app
+    profiles:
+      - test
