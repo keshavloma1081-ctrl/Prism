@@ -1,14 +1,15 @@
 """
 PRISM — api/main.py
-FastAPI REST API Layer
+FastAPI REST API Layer + WebSocket Streaming
 
 The external surface of PRISM.
 Every PRISM capability exposed as a clean REST endpoint.
+Real-time EAT event streaming via WebSocket.
 
 Sessions and events persisted to SQLite/PostgreSQL.
 Verdict, Decay, Compass are session-scoped in memory.
 
-Endpoints:
+REST Endpoints:
   POST /sessions/              → create new workflow session
   POST /sessions/{id}/agents   → register agents
   POST /sessions/{id}/events   → stream EAT events
@@ -19,14 +20,20 @@ Endpoints:
   GET  /sessions/{id}/report   → generate Chronicle report
   GET  /sessions/{id}/compass  → optimization recommendations
   GET  /health                 → system health check
+
+WebSocket Endpoints:
+  WS /ws/{session_id}          → real-time session telemetry
+  WS /ws/stream/all            → global event stream
 """
 
 from __future__ import annotations
 import uuid
+import asyncio
+import json
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -81,12 +88,111 @@ def startup():
 
 
 # ─── IN-MEMORY CACHE ──────────────────────────────────────────────────────────
-# Sessions + events → SQLite/PostgreSQL via db/repository.py
-# Verdict, Decay, Compass → session-scoped, rebuilt on demand
 
 verdicts:  Dict[str, VerdictScorer]    = {}
 detectors: Dict[str, DecayDetector]    = {}
 compasses: Dict[str, CompassOptimizer] = {}
+
+
+# ─── WEBSOCKET CONNECTION MANAGER ─────────────────────────────────────────────
+
+class ConnectionManager:
+    """Manages active WebSocket connections per session."""
+
+    def __init__(self):
+        self.active: Dict[str, List[WebSocket]] = {}
+
+    async def connect(self, session_id: str, ws: WebSocket) -> None:
+        await ws.accept()
+        self.active.setdefault(session_id, []).append(ws)
+
+    def disconnect(self, session_id: str, ws: WebSocket) -> None:
+        if session_id in self.active:
+            self.active[session_id] = [
+                w for w in self.active[session_id] if w != ws
+            ]
+
+    async def broadcast(self, session_id: str, data: dict) -> None:
+        dead = []
+        for ws in self.active.get(session_id, []):
+            try:
+                await ws.send_json(data)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.disconnect(session_id, ws)
+
+    async def broadcast_all(self, data: dict) -> None:
+        for session_id in list(self.active.keys()):
+            await self.broadcast(session_id, data)
+
+
+manager = ConnectionManager()
+
+
+# ─── WEBSOCKET ENDPOINTS ──────────────────────────────────────────────────────
+
+@app.websocket("/ws/{session_id}")
+async def websocket_session(
+    websocket:  WebSocket,
+    session_id: str,
+    db:         Session = Depends(get_db)
+):
+    """
+    WebSocket endpoint for real-time session telemetry.
+    Streams EAT events, VERDICT scores, DECAY alerts.
+    Connect: ws://localhost:8000/ws/{session_id}
+    """
+    await manager.connect(session_id, websocket)
+    try:
+        # Send initial session state on connect
+        try:
+            session = _load_session(session_id, db)
+            await websocket.send_json({
+                "type": "session_state",
+                "payload": {
+                    "session_id":   session_id,
+                    "total_events": session.total_events,
+                    "status":       session.status.value,
+                    "human_agents": len(session.human_agents),
+                    "ai_agents":    len(session.ai_agents)
+                }
+            })
+        except Exception:
+            pass
+
+        # Keep connection alive — ping every 30s
+        while True:
+            try:
+                await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=30.0
+                )
+            except asyncio.TimeoutError:
+                await websocket.send_json({"type": "ping"})
+
+    except WebSocketDisconnect:
+        manager.disconnect(session_id, websocket)
+
+
+@app.websocket("/ws/stream/all")
+async def websocket_all_sessions(websocket: WebSocket):
+    """
+    WebSocket endpoint for global event stream.
+    Receives events from ALL active sessions.
+    """
+    await manager.connect("__all__", websocket)
+    try:
+        while True:
+            try:
+                await asyncio.wait_for(
+                    websocket.receive_text(),
+                    timeout=30.0
+                )
+            except asyncio.TimeoutError:
+                await websocket.send_json({"type": "ping"})
+    except WebSocketDisconnect:
+        manager.disconnect("__all__", websocket)
 
 
 # ─── REQUEST MODELS ───────────────────────────────────────────────────────────
@@ -150,10 +256,6 @@ def _load_session(
     session_id: str,
     db:         Session
 ) -> WorkflowSession:
-    """
-    Load a WorkflowSession from DB and reconstruct
-    its agents and events into the domain model.
-    """
     s_repo = SessionRepository(db)
     a_repo = AgentRepository(db)
     e_repo = EventRepository(db)
@@ -167,7 +269,6 @@ def _load_session(
 
     session = s_repo.to_domain(db_session)
 
-    # Load agents
     for db_agent in a_repo.get_by_session(session_id):
         if db_agent.agent_type == "HUMAN":
             agent = a_repo.to_human_domain(db_agent)
@@ -176,7 +277,6 @@ def _load_session(
             agent = a_repo.to_ai_domain(db_agent)
             session.ai_agents[agent.agent_id] = agent
 
-    # Load events
     for db_event in e_repo.get_by_session(session_id):
         event = e_repo.to_domain(db_event)
         session.events.append(event)
@@ -188,8 +288,6 @@ def _build_eat_event(
     req:        SubmitEventRequest,
     session_id: str
 ) -> EATEvent:
-    """Convert API request to EATEvent domain model."""
-
     prior_belief = BeliefState(
         **req.prior_belief.model_dump()
     ) if req.prior_belief else None
@@ -250,7 +348,7 @@ def create_session(
     req: CreateSessionRequest,
     db:  Session = Depends(get_db)
 ):
-    session  = WorkflowSession(
+    session = WorkflowSession(
         client_id   = req.client_id,
         workflow_id = req.workflow_id,
         metadata    = req.metadata
@@ -323,10 +421,12 @@ def register_human_agent(
 ):
     s_repo = SessionRepository(db)
     if s_repo.get(session_id) is None:
-        raise HTTPException(status_code=404,
-                            detail=f"Session '{session_id}' not found")
+        raise HTTPException(
+            status_code = 404,
+            detail      = f"Session '{session_id}' not found"
+        )
 
-    agent  = HumanAgent(
+    agent = HumanAgent(
         name      = req.name,
         role      = req.role,
         client_id = s_repo.get(session_id).client_id,
@@ -335,7 +435,6 @@ def register_human_agent(
     a_repo = AgentRepository(db)
     a_repo.create_human(session_id, agent)
 
-    # Update in-memory session if cached
     if session_id in verdicts:
         session = _load_session(session_id, db)
         verdicts[session_id]  = VerdictScorer(session)
@@ -357,10 +456,12 @@ def register_ai_agent(
 ):
     s_repo = SessionRepository(db)
     if s_repo.get(session_id) is None:
-        raise HTTPException(status_code=404,
-                            detail=f"Session '{session_id}' not found")
+        raise HTTPException(
+            status_code = 404,
+            detail      = f"Session '{session_id}' not found"
+        )
 
-    agent  = AIAgent(
+    agent = AIAgent(
         model_name = req.model_name,
         provider   = req.provider,
         client_id  = s_repo.get(session_id).client_id,
@@ -385,7 +486,7 @@ def register_ai_agent(
 # ── Event Streaming ────────────────────────────────────────────────────────────
 
 @app.post("/sessions/{session_id}/events")
-def submit_event(
+async def submit_event(
     session_id: str,
     req:        SubmitEventRequest,
     db:         Session = Depends(get_db)
@@ -418,15 +519,15 @@ def submit_event(
     e_repo = EventRepository(db)
     e_repo.create(session_id, event)
 
-    # Check DECAY every 5 events
+    # Check DECAY
     detector = detectors.get(session_id)
     if detector is None:
         detector = DecayDetector(session)
         detectors[session_id] = detector
 
+    session.add_event(event)
     decay_alerts = []
     if session.total_events % 5 == 0:
-        session.add_event(event)
         alerts = detector.check(current_t=event.t)
         decay_alerts = [
             {
@@ -436,8 +537,25 @@ def submit_event(
             }
             for a in alerts
         ]
-    else:
-        session.add_event(event)
+
+    # ── Broadcast to WebSocket subscribers ───────────────────────
+    broadcast_data = {
+        "type": "eat_event",
+        "payload": {
+            "event_id":        event.event_id,
+            "agent_id":        event.agent_id,
+            "agent_type":      event.agent_type.value,
+            "event_type":      event.event_type.value,
+            "t":               event.t,
+            "delta_magnitude": round(event.delta_magnitude, 4),
+            "groundedness":    event.groundedness,
+            "novelty_delta":   event.novelty_delta,
+            "decay_alerts":    decay_alerts,
+            "timestamp":       datetime.now(timezone.utc).isoformat()
+        }
+    }
+    await manager.broadcast(session_id, broadcast_data)
+    await manager.broadcast("__all__", broadcast_data)
 
     return {
         "event_id":        event.event_id,
@@ -464,8 +582,10 @@ def get_events(
 ):
     s_repo = SessionRepository(db)
     if s_repo.get(session_id) is None:
-        raise HTTPException(status_code=404,
-                            detail=f"Session '{session_id}' not found")
+        raise HTTPException(
+            status_code = 404,
+            detail      = f"Session '{session_id}' not found"
+        )
 
     e_repo = EventRepository(db)
     events = e_repo.get_by_session(
@@ -557,24 +677,27 @@ def run_ghost(
     ghost = GhostRunner(session)
     sig   = ghost.run()
     return {
-        "session_id":      session_id,
-        "emergence_score": sig.emergence_score,
-        "ai_value_score":  sig.ai_value_score,
+        "session_id":        session_id,
+        "emergence_score":   sig.emergence_score,
+        "ai_value_score":    sig.ai_value_score,
         "human_value_score": sig.human_value_score,
         "concept_emergence": list(sig.concept_emergence),
-        "ai_unique":       list(sig.ai_unique_concepts),
-        "human_unique":    list(sig.human_unique_concepts),
-        "entropy_lift":    sig.entropy_lift,
-        "magnitude_lift":  sig.magnitude_lift,
-        "verdict":         sig.verdict(),
-        "recommendation":  sig.recommendation
+        "ai_unique":         list(sig.ai_unique_concepts),
+        "human_unique":      list(sig.human_unique_concepts),
+        "entropy_lift":      sig.entropy_lift,
+        "magnitude_lift":    sig.magnitude_lift,
+        "verdict":           sig.verdict(),
+        "recommendation":    sig.recommendation
     }
 
 
 # ── COMPASS ────────────────────────────────────────────────────────────────────
 
 @app.get("/sessions/{session_id}/compass")
-def get_compass(session_id: str, db: Session = Depends(get_db)):
+def get_compass(
+    session_id: str,
+    db:         Session = Depends(get_db)
+):
     s_repo = SessionRepository(db)
     if s_repo.get(session_id) is None:
         raise HTTPException(
@@ -619,8 +742,10 @@ def complete_session(
         completed_at = datetime.now(timezone.utc)
     )
     if result is None:
-        raise HTTPException(status_code=404,
-                            detail=f"Session '{session_id}' not found")
+        raise HTTPException(
+            status_code = 404,
+            detail      = f"Session '{session_id}' not found"
+        )
     return {
         "session_id":   session_id,
         "status":       "COMPLETED",
